@@ -7,17 +7,21 @@ import os
 import json
 import asyncio
 import aiofiles
-from datetime import date
+from datetime import datetime, date
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
-    MessageHandler, filters
+    MessageHandler, filters, ConversationHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import nest_asyncio
+import pytz
 
 # File to store goals and check-ins
 GOAL_FILE = "goals.json"
+
+# Conversation state for reminder
+WAITING_FOR_TIME = 1
 
 # === Async Load/Save Helpers ===
 async def load_data():
@@ -117,58 +121,93 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
-# === Reminder Feature ===
+# === Reminder Feature (IMPROVED) ===
 
-pending_reminders = {}
-
-async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ask user for reminder time"""
     await update.message.reply_text(
-        "⏰ At what time should I remind you daily?\n"
+        "⏰ At what time should I remind you daily? (IST - India Standard Time)\n"
         "Send time in 24-hour format: HH:MM\n"
-        "Example: 09:00 or 21:30"
+        "Example: 09:00 or 21:30\n\n"
+        "Send /cancel to cancel."
     )
-    pending_reminders[update.effective_chat.id] = True
+    return WAITING_FOR_TIME
 
-async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process the time input from user"""
     chat_id = update.effective_chat.id
-
-    if not pending_reminders.get(chat_id):
-        return
-
     time_text = update.message.text.strip()
+    
     try:
+        # Parse the time
         hour, minute = map(int, time_text.split(":"))
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError
-
-        scheduler = context.application.bot_data["scheduler"]
+        
+        # Get scheduler
+        scheduler = context.application.bot_data.get("scheduler")
+        if not scheduler:
+            await update.message.reply_text("❌ Scheduler not available. Please try again later.")
+            return ConversationHandler.END
+        
+        # Remove any existing jobs for this chat
+        existing_jobs = scheduler.get_jobs()
+        for job in existing_jobs:
+            if job.id == f"reminder_{chat_id}":
+                job.remove()
+        
+        # Add new reminder job with IST timezone
+        ist = pytz.timezone('Asia/Kolkata')
         scheduler.add_job(
             reminder_job,
             trigger='cron',
             hour=hour,
             minute=minute,
-            args=[chat_id, context.application]
+            timezone=ist,
+            id=f"reminder_{chat_id}",
+            args=[chat_id, context.application],
+            replace_existing=True
         )
-
+        
+        print(f"✅ Reminder set for chat {chat_id} at {hour:02d}:{minute:02d} IST")
+        
         await update.message.reply_text(
-            f"✅ Daily reminder set for {hour:02d}:{minute:02d}\n"
-            f"I'll remind you every day at this time!"
+            f"✅ Daily reminder set for {hour:02d}:{minute:02d} IST\n"
+            f"I'll remind you every day at this time! 🔥\n\n"
+            f"Note: Reminders are lost when the bot restarts."
         )
-        pending_reminders.pop(chat_id)
-    except:
+        
+        return ConversationHandler.END
+        
+    except ValueError:
         await update.message.reply_text(
             "❌ Invalid format. Please use HH:MM in 24-hour format.\n"
-            "Example: 09:00 or 21:30"
+            "Example: 09:00 or 21:30\n\n"
+            "Send /cancel to cancel."
         )
+        return WAITING_FOR_TIME
+    except Exception as e:
+        print(f"❌ Error setting reminder: {e}")
+        await update.message.reply_text(
+            "❌ Sorry, there was an error setting the reminder. Please try again."
+        )
+        return ConversationHandler.END
+
+async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel reminder setup"""
+    await update.message.reply_text("❌ Reminder setup cancelled.")
+    return ConversationHandler.END
 
 async def reminder_job(chat_id, application):
     """Send daily reminder message"""
-    await application.bot.send_message(
-        chat_id=chat_id, 
-        text="⏰ Time for your daily /checkin! Don't break the streak! 🔥"
-    )
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id, 
+            text="⏰ Time for your daily /checkin! Don't break the streak! 🔥"
+        )
+        print(f"✅ Reminder sent to chat {chat_id}")
+    except Exception as e:
+        print(f"❌ Error sending reminder to {chat_id}: {e}")
 
 # === Main Function ===
 
@@ -185,16 +224,23 @@ async def main():
     scheduler = AsyncIOScheduler()
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
+    print("✅ Scheduler started")
 
     # Add Command Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setgoals", set_goals))
     app.add_handler(CommandHandler("checkin", checkin))
     app.add_handler(CommandHandler("progress", show_progress))
-    app.add_handler(CommandHandler("setreminder", set_reminder))
     
-    # Handle text messages (for time input)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time_input))
+    # Reminder conversation handler
+    reminder_handler = ConversationHandler(
+        entry_points=[CommandHandler("setreminder", set_reminder_start)],
+        states={
+            WAITING_FOR_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder_time)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_reminder)]
+    )
+    app.add_handler(reminder_handler)
 
     print("✅ Bot is running...")
     await app.run_polling()
