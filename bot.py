@@ -72,6 +72,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Start by setting your goals with /goals"
     )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help message"""
+    await update.message.reply_text(
+        "🤖 *Accountability Bot Help*\n\n"
+        "*Commands:*\n"
+        "/goals - Set or modify your daily goals\n"
+        "/checkin - Mark which goals you completed today\n"
+        "/progress - View your 7-day progress and streak\n"
+        "/reminders - Set time reminders for your goals\n"
+        "/help - Show this help message\n\n"
+        "*How it works:*\n"
+        "1️⃣ Set your goals with /goals\n"
+        "2️⃣ Check in daily with /checkin\n"
+        "3️⃣ Track your progress with /progress\n"
+        "4️⃣ Stay on track with /reminders",
+        parse_mode="Markdown"
+    )
+
 async def goals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start goal setting process"""
     user_id = update.effective_user.id
@@ -198,7 +216,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("remind_"):
         # Handle reminder setting for specific goal
         goal = query.data.replace("remind_", "")
-        return await set_goal_reminder(update, context, goal)
+        context.user_data['setting_reminder_for'] = goal
+        await query.edit_message_text(
+            f"⏰ Set reminder for: *{goal}*\n\n"
+            f"Send time in HH:MM format (24-hour, IST)\n"
+            f"Example: 09:00 or 21:30\n\n"
+            f"Send /cancel to go back",
+            parse_mode="Markdown"
+        )
+        return SETTING_REMINDER_TIME
     
     elif query.data == "clear_reminders":
         user_data = await get_user_data(user_id)
@@ -362,18 +388,6 @@ async def reminders_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-async def set_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE, goal: str):
-    """Ask for reminder time for specific goal"""
-    await update.callback_query.edit_message_text(
-        f"⏰ Set reminder for: *{goal}*\n\n"
-        f"Send time in HH:MM format (24-hour, IST)\n"
-        f"Example: 09:00 or 21:30\n\n"
-        f"Send /cancel to go back",
-        parse_mode="Markdown"
-    )
-    context.user_data['setting_reminder_for'] = goal
-    return SETTING_REMINDER_TIME
-
 async def save_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save reminder time for goal"""
     user_id = update.effective_user.id
@@ -453,47 +467,69 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel any operation"""
     await update.message.reply_text("❌ Operation cancelled.")
     context.user_data.pop('setting_reminder_for', None)
+    context.user_data.pop('temp_goals', None)
     return ConversationHandler.END
 
 # === Main Function ===
 
 async def main():
     """Start the bot"""
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        print("❌ BOT_TOKEN not set.")
-        return
+    try:
+        token = os.environ.get("BOT_TOKEN")
+        if not token:
+            print("❌ BOT_TOKEN not set.")
+            return
 
-    app = ApplicationBuilder().token(token).build()
+        print("🚀 Starting bot initialization...")
+        app = ApplicationBuilder().token(token).build()
 
-    # Scheduler setup
-    scheduler = AsyncIOScheduler()
-    scheduler.start()
-    app.bot_data["scheduler"] = scheduler
+        # Scheduler setup
+        print("📅 Setting up scheduler...")
+        scheduler = AsyncIOScheduler()
+        scheduler.start()
+        app.bot_data["scheduler"] = scheduler
 
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("checkin", checkin))
-    app.add_handler(CommandHandler("progress", progress))
-    
-    # Goals conversation
-    goals_handler = ConversationHandler(
-        entry_points=[CommandHandler("goals", goals_start)],
-        states={
-            ADDING_GOALS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_goal),
-                CommandHandler("done", done_adding_goals)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    )
-    app.add_handler(goals_handler)
-    
-    # Button callbacks
-    app.add_handler(CallbackQueryHandler(button_callback))
+        # Command handlers
+        print("🔧 Adding command handlers...")
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("checkin", checkin))
+        app.add_handler(CommandHandler("progress", progress))
+        
+        # Goals conversation
+        goals_handler = ConversationHandler(
+            entry_points=[CommandHandler("goals", goals_start)],
+            states={
+                ADDING_GOALS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, add_goal),
+                    CommandHandler("done", done_adding_goals)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)]
+        )
+        app.add_handler(goals_handler)
+        
+        # Reminders conversation
+        reminders_handler = ConversationHandler(
+            entry_points=[CommandHandler("reminders", reminders_menu)],
+            states={
+                SETTING_REMINDER_TIME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, save_goal_reminder)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)]
+        )
+        app.add_handler(reminders_handler)
+        
+        # Button callbacks (must be added last)
+        app.add_handler(CallbackQueryHandler(button_callback))
 
-    print("✅ Bot is running...")
-    await app.run_polling()
+        print("✅ Bot is running and ready!")
+        await app.run_polling(drop_pending_updates=True)
+        
+    except Exception as e:
+        print(f"❌ Error starting bot: {e}")
+        raise
 
 if __name__ == "__main__":
     nest_asyncio.apply()
