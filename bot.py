@@ -81,6 +81,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/checkin - Mark which goals you completed today\n"
         "/progress - View your 7-day progress and streak\n"
         "/reminders - Set time reminders for your goals\n"
+        "/debug - Check scheduled reminders (testing)\n"
         "/help - Show this help message\n\n"
         "*How it works:*\n"
         "1️⃣ Set your goals with /goals\n"
@@ -89,6 +90,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4️⃣ Stay on track with /reminders",
         parse_mode="Markdown"
     )
+
+async def debug_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug command to check scheduled jobs"""
+    scheduler = context.application.bot_data.get("scheduler")
+    if not scheduler:
+        await update.message.reply_text("❌ Scheduler not found!")
+        return
+    
+    jobs = scheduler.get_jobs()
+    if not jobs:
+        await update.message.reply_text("📭 No reminders scheduled")
+        return
+    
+    msg = "🔍 *Scheduled Reminders:*\n\n"
+    for job in jobs:
+        msg += f"• {job.id}\n"
+        msg += f"  Next run: {job.next_run_time}\n\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def goals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start goal setting process"""
@@ -239,6 +259,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     job.remove()
         
         await query.edit_message_text("🔕 All reminders cleared!")
+    
+    # Don't end conversation if we're setting a reminder
+    if query.data.startswith("remind_"):
+        return SETTING_REMINDER_TIME
     
     return ConversationHandler.END
 
@@ -409,6 +433,8 @@ async def save_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_data['reminders'][goal] = f"{hour:02d}:{minute:02d}"
         await save_user_data(user_id, user_data)
         
+        print(f"💾 Saved reminder for user {user_id}, goal '{goal}' at {hour:02d}:{minute:02d}")
+        
         # Schedule with APScheduler
         scheduler = context.application.bot_data.get("scheduler")
         if scheduler:
@@ -418,6 +444,7 @@ async def save_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE)
             for job in existing_jobs:
                 if job.id == job_id:
                     job.remove()
+                    print(f"🗑️ Removed old reminder job: {job_id}")
             
             # Add new job
             ist = pytz.timezone('Asia/Kolkata')
@@ -431,9 +458,14 @@ async def save_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 args=[update.effective_chat.id, context.application, goal],
                 replace_existing=True
             )
+            print(f"✅ Scheduled reminder job: {job_id} at {hour:02d}:{minute:02d} IST")
+            print(f"📋 Active jobs: {[job.id for job in scheduler.get_jobs()]}")
+        else:
+            print("❌ Scheduler not found in bot_data!")
         
         await update.message.reply_text(
             f"✅ Reminder set for *{goal}* at {hour:02d}:{minute:02d} IST\n\n"
+            f"You'll receive a notification at this time every day.\n\n"
             f"Use /reminders to manage all reminders.",
             parse_mode="Markdown"
         )
@@ -449,7 +481,43 @@ async def save_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return SETTING_REMINDER_TIME
 
-async def goal_reminder_job(chat_id, application, goal):
+async def reload_all_reminders(application):
+    """Reload all reminders from storage on bot startup"""
+    try:
+        data = await load_data()
+        scheduler = application.bot_data.get("scheduler")
+        
+        if not scheduler:
+            print("❌ No scheduler found for reload")
+            return
+        
+        reminder_count = 0
+        for user_id, user_data in data.items():
+            reminders = user_data.get('reminders', {})
+            for goal, time_str in reminders.items():
+                try:
+                    hour, minute = map(int, time_str.split(":"))
+                    job_id = f"reminder_{user_id}_{goal}"
+                    
+                    ist = pytz.timezone('Asia/Kolkata')
+                    scheduler.add_job(
+                        goal_reminder_job,
+                        trigger='cron',
+                        hour=hour,
+                        minute=minute,
+                        timezone=ist,
+                        id=job_id,
+                        args=[int(user_id), application, goal],
+                        replace_existing=True
+                    )
+                    reminder_count += 1
+                    print(f"✅ Reloaded reminder: {job_id} at {time_str} IST")
+                except Exception as e:
+                    print(f"❌ Failed to reload reminder for {user_id}/{goal}: {e}")
+        
+        print(f"🔄 Reloaded {reminder_count} reminders from storage")
+    except Exception as e:
+        print(f"❌ Error reloading reminders: {e}")
     """Send reminder for specific goal"""
     try:
         await application.bot.send_message(
@@ -488,6 +556,10 @@ async def main():
         scheduler = AsyncIOScheduler()
         scheduler.start()
         app.bot_data["scheduler"] = scheduler
+        
+        # Reload existing reminders
+        print("🔄 Reloading existing reminders...")
+        await reload_all_reminders(app)
 
         # Command handlers
         print("🔧 Adding command handlers...")
@@ -495,6 +567,7 @@ async def main():
         app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("checkin", checkin))
         app.add_handler(CommandHandler("progress", progress))
+        app.add_handler(CommandHandler("debug", debug_reminders))
         
         # Goals conversation
         goals_handler = ConversationHandler(
@@ -509,20 +582,25 @@ async def main():
         )
         app.add_handler(goals_handler)
         
-        # Reminders conversation
+        # Reminders conversation - must include callback query pattern
         reminders_handler = ConversationHandler(
-            entry_points=[CommandHandler("reminders", reminders_menu)],
+            entry_points=[
+                CommandHandler("reminders", reminders_menu),
+                CallbackQueryHandler(button_callback, pattern="^remind_")
+            ],
             states={
                 SETTING_REMINDER_TIME: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, save_goal_reminder)
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, save_goal_reminder),
+                    CallbackQueryHandler(button_callback, pattern="^remind_")
                 ]
             },
-            fallbacks=[CommandHandler("cancel", cancel)]
+            fallbacks=[CommandHandler("cancel", cancel)],
+            per_message=False
         )
         app.add_handler(reminders_handler)
         
-        # Button callbacks (must be added last)
-        app.add_handler(CallbackQueryHandler(button_callback))
+        # Button callbacks (must be added last, but EXCLUDE reminder buttons)
+        app.add_handler(CallbackQueryHandler(button_callback, pattern="^(?!remind_).*$"))
 
         print("✅ Bot is running and ready!")
         await app.run_polling(drop_pending_updates=True)
