@@ -195,6 +195,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "skip_checkin":
         await query.edit_message_text("⏭️ Check-in skipped. See you tomorrow! 💪")
     
+    elif query.data.startswith("remind_"):
+        # Handle reminder setting for specific goal
+        goal = query.data.replace("remind_", "")
+        return await set_goal_reminder(update, context, goal)
+    
+    elif query.data == "clear_reminders":
+        user_data = await get_user_data(user_id)
+        user_data['reminders'] = {}
+        await save_user_data(user_id, user_data)
+        
+        # Remove all scheduled jobs for this user
+        scheduler = context.bot_data.get("scheduler")
+        if scheduler:
+            for job in scheduler.get_jobs():
+                if f"reminder_{user_id}_" in job.id:
+                    job.remove()
+        
+        await query.edit_message_text("🔕 All reminders cleared!")
+    
     return ConversationHandler.END
 
 async def show_checkin_status(query, user_id, user_data, today):
@@ -318,9 +337,122 @@ def calculate_streak(user_data):
     
     return streak
 
+async def reminders_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show reminders menu"""
+    user_id = update.effective_user.id
+    user_data = await get_user_data(user_id)
+    
+    if not user_data['goals']:
+        await update.message.reply_text("⚠️ No goals set! Use /goals first.")
+        return
+    
+    keyboard = []
+    for goal in user_data['goals']:
+        time = user_data['reminders'].get(goal, "Not set")
+        button_text = f"{'⏰' if time != 'Not set' else '⭕'} {goal} - {time}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"remind_{goal}")])
+    
+    keyboard.append([InlineKeyboardButton("🔕 Clear All Reminders", callback_data="clear_reminders")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "⏰ *Set Reminders for Your Goals*\n\n"
+        "Click a goal to set reminder time:",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+
+async def set_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE, goal: str):
+    """Ask for reminder time for specific goal"""
+    await update.callback_query.edit_message_text(
+        f"⏰ Set reminder for: *{goal}*\n\n"
+        f"Send time in HH:MM format (24-hour, IST)\n"
+        f"Example: 09:00 or 21:30\n\n"
+        f"Send /cancel to go back",
+        parse_mode="Markdown"
+    )
+    context.user_data['setting_reminder_for'] = goal
+    return SETTING_REMINDER_TIME
+
+async def save_goal_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save reminder time for goal"""
+    user_id = update.effective_user.id
+    goal = context.user_data.get('setting_reminder_for')
+    
+    if not goal:
+        await update.message.reply_text("❌ Error: No goal selected.")
+        return ConversationHandler.END
+    
+    time_text = update.message.text.strip()
+    
+    try:
+        hour, minute = map(int, time_text.split(":"))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        
+        # Save reminder time
+        user_data = await get_user_data(user_id)
+        user_data['reminders'][goal] = f"{hour:02d}:{minute:02d}"
+        await save_user_data(user_id, user_data)
+        
+        # Schedule with APScheduler
+        scheduler = context.application.bot_data.get("scheduler")
+        if scheduler:
+            # Remove old job if exists
+            job_id = f"reminder_{user_id}_{goal}"
+            existing_jobs = scheduler.get_jobs()
+            for job in existing_jobs:
+                if job.id == job_id:
+                    job.remove()
+            
+            # Add new job
+            ist = pytz.timezone('Asia/Kolkata')
+            scheduler.add_job(
+                goal_reminder_job,
+                trigger='cron',
+                hour=hour,
+                minute=minute,
+                timezone=ist,
+                id=job_id,
+                args=[update.effective_chat.id, context.application, goal],
+                replace_existing=True
+            )
+        
+        await update.message.reply_text(
+            f"✅ Reminder set for *{goal}* at {hour:02d}:{minute:02d} IST\n\n"
+            f"Use /reminders to manage all reminders.",
+            parse_mode="Markdown"
+        )
+        
+        context.user_data.pop('setting_reminder_for', None)
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid format. Please use HH:MM\n"
+            "Example: 09:00 or 21:30\n\n"
+            "Send /cancel to go back"
+        )
+        return SETTING_REMINDER_TIME
+
+async def goal_reminder_job(chat_id, application, goal):
+    """Send reminder for specific goal"""
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏰ *Reminder: {goal}*\n\n"
+                 f"Time to work on your goal! 🔥\n"
+                 f"Use /checkin when done.",
+            parse_mode="Markdown"
+        )
+        print(f"✅ Reminder sent for goal '{goal}' to chat {chat_id}")
+    except Exception as e:
+        print(f"❌ Error sending reminder: {e}")
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel any operation"""
     await update.message.reply_text("❌ Operation cancelled.")
+    context.user_data.pop('setting_reminder_for', None)
     return ConversationHandler.END
 
 # === Main Function ===
