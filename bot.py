@@ -1,17 +1,17 @@
 from keep_alive import keep_alive
-
 keep_alive()
+
 from dotenv import load_dotenv
 load_dotenv()
 import os
 import json
 import asyncio
 import aiofiles
-from datetime import datetime, date
-from telegram import Update
+from datetime import datetime, date, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
-    MessageHandler, filters, ConversationHandler
+    MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import nest_asyncio
@@ -20,12 +20,12 @@ import pytz
 # File to store goals and check-ins
 GOAL_FILE = "goals.json"
 
-# Conversation state for reminder
-WAITING_FOR_TIME = 1
+# Conversation states
+ADDING_GOALS, WAITING_FOR_GOAL, SETTING_REMINDER_TIME = range(3)
 
-# === Async Load/Save Helpers ===
+# === Data Management ===
 async def load_data():
-    """Load goals data from JSON file"""
+    """Load all user data"""
     try:
         async with aiofiles.open(GOAL_FILE, "r") as f:
             contents = await f.read()
@@ -34,180 +34,294 @@ async def load_data():
         return {}
 
 async def save_data(data):
-    """Save goals data to JSON file"""
+    """Save all user data"""
     async with aiofiles.open(GOAL_FILE, "w") as f:
         await f.write(json.dumps(data, indent=4))
 
-# === Bot Command Handlers ===
+async def get_user_data(user_id):
+    """Get data for specific user"""
+    data = await load_data()
+    if str(user_id) not in data:
+        data[str(user_id)] = {
+            "goals": [],
+            "checkins": {},  # date -> {goal: True/False}
+            "reminders": {}  # goal -> time
+        }
+        await save_data(data)
+    return data[str(user_id)]
+
+async def save_user_data(user_id, user_data):
+    """Save data for specific user"""
+    data = await load_data()
+    data[str(user_id)] = user_data
+    await save_data(data)
+
+# === Bot Commands ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message with all commands"""
+    """Welcome message"""
     await update.message.reply_text(
-        "👋 Hi! I'm your accountability bot.\n\n"
-        "📋 Commands:\n"
-        "• /setgoals AIML DSA Gym - Set your daily goals\n"
-        "• /checkin - Mark today as complete\n"
-        "• /progress - See your progress\n"
-        "• /setreminder - Set daily reminder time\n\n"
-        "Let's get started with /setgoals!"
+        "👋 Welcome to Your Accountability Bot!\n\n"
+        "🎯 Track your daily goals and build consistency!\n\n"
+        "Commands:\n"
+        "• /goals - Set up your goals\n"
+        "• /checkin - Mark today's progress\n"
+        "• /progress - See your stats\n"
+        "• /reminders - Set goal reminders\n"
+        "• /help - Show all commands\n\n"
+        "Start by setting your goals with /goals"
     )
 
-async def set_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set user's daily goals"""
-    user_id = str(update.effective_user.id)
-    goals = context.args
+async def goals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start goal setting process"""
+    user_id = update.effective_user.id
+    user_data = await get_user_data(user_id)
     
-    if not goals or all(g.strip() == "" for g in goals):
+    if user_data["goals"]:
+        # Show existing goals
+        goals_list = "\n".join([f"• {goal}" for goal in user_data["goals"]])
+        keyboard = [
+            [InlineKeyboardButton("➕ Add More Goals", callback_data="add_goals")],
+            [InlineKeyboardButton("🗑️ Clear All Goals", callback_data="clear_goals")],
+            [InlineKeyboardButton("✅ Keep Current Goals", callback_data="keep_goals")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await update.message.reply_text(
-            "⚠️ Please specify your goals like:\n/setgoals AIML DSA Gym"
+            f"📋 Your Current Goals:\n\n{goals_list}\n\n"
+            f"What would you like to do?",
+            reply_markup=reply_markup
         )
-        return
-    
-    data = await load_data()
-    data[user_id] = {
-        "goals": goals,
-        "checkins": data.get(user_id, {}).get("checkins", {})
-    }
-    await save_data(data)
-    await update.message.reply_text(f"🎯 Goals set: {', '.join(goals)}")
-
-async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mark today as checked in"""
-    user_id = str(update.effective_user.id)
-    today = str(date.today())
-    data = await load_data()
-
-    if user_id not in data:
-        await update.message.reply_text(
-            "⚠️ You haven't set goals yet. Use /setgoals first."
-        )
-        return
-
-    if today in data[user_id]["checkins"]:
-        await update.message.reply_text("✅ You've already checked in today!")
+        return ConversationHandler.END
     else:
-        data[user_id]["checkins"][today] = "✅"
-        await save_data(data)
+        # Start fresh
+        context.user_data['temp_goals'] = []
         await update.message.reply_text(
-            "🔥 Check-in saved for today! Keep it up!"
+            "🎯 Let's set up your goals!\n\n"
+            "📝 Send me your first goal:\n"
+            "Example: AIML, Study DSA, Go to Gym\n\n"
+            "Send /done when finished"
         )
+        return ADDING_GOALS
 
-async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's progress and stats"""
-    user_id = str(update.effective_user.id)
-    data = await load_data()
-
-    if user_id not in data:
-        await update.message.reply_text(
-            "⚠️ You haven't set any goals yet. Use /setgoals first."
-        )
-        return
-
-    user_data = data[user_id]
-    goals = ', '.join(user_data['goals'])
-    checkins = user_data.get("checkins", {})
-    days_checked_in = len(checkins)
+async def add_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a goal to temporary list"""
+    goal = update.message.text.strip()
     
-    checkin_dates = "\n".join(
-        f"✅ {d}" for d in sorted(checkins.keys(), reverse=True)[:10]
-    )
-
-    message = (
-        f"📊 *Your Progress*\n\n"
-        f"🎯 Goals: {goals}\n"
-        f"🔥 Days Checked In: {days_checked_in}\n\n"
-        f"*Recent Check-ins:*\n{checkin_dates if checkin_dates else 'No check-ins yet'}"
-    )
-
-    await update.message.reply_text(message, parse_mode="Markdown")
-
-# === Reminder Feature (IMPROVED) ===
-
-async def set_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask user for reminder time"""
+    if 'temp_goals' not in context.user_data:
+        context.user_data['temp_goals'] = []
+    
+    context.user_data['temp_goals'].append(goal)
+    goal_num = len(context.user_data['temp_goals'])
+    
+    goals_so_far = "\n".join([f"✅ {g}" for g in context.user_data['temp_goals']])
+    
     await update.message.reply_text(
-        "⏰ At what time should I remind you daily? (IST - India Standard Time)\n"
-        "Send time in 24-hour format: HH:MM\n"
-        "Example: 09:00 or 21:30\n\n"
-        "Send /cancel to cancel."
+        f"✅ Goal {goal_num} added: {goal}\n\n"
+        f"Goals so far:\n{goals_so_far}\n\n"
+        f"📝 Send next goal or /done to finish"
     )
-    return WAITING_FOR_TIME
+    return ADDING_GOALS
 
-async def set_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process the time input from user"""
-    chat_id = update.effective_chat.id
-    time_text = update.message.text.strip()
+async def done_adding_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Finish adding goals"""
+    user_id = update.effective_user.id
     
-    try:
-        # Parse the time
-        hour, minute = map(int, time_text.split(":"))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError
-        
-        # Get scheduler
-        scheduler = context.application.bot_data.get("scheduler")
-        if not scheduler:
-            await update.message.reply_text("❌ Scheduler not available. Please try again later.")
-            return ConversationHandler.END
-        
-        # Remove any existing jobs for this chat
-        existing_jobs = scheduler.get_jobs()
-        for job in existing_jobs:
-            if job.id == f"reminder_{chat_id}":
-                job.remove()
-        
-        # Add new reminder job with IST timezone
-        ist = pytz.timezone('Asia/Kolkata')
-        scheduler.add_job(
-            reminder_job,
-            trigger='cron',
-            hour=hour,
-            minute=minute,
-            timezone=ist,
-            id=f"reminder_{chat_id}",
-            args=[chat_id, context.application],
-            replace_existing=True
-        )
-        
-        print(f"✅ Reminder set for chat {chat_id} at {hour:02d}:{minute:02d} IST")
-        
-        await update.message.reply_text(
-            f"✅ Daily reminder set for {hour:02d}:{minute:02d} IST\n"
-            f"I'll remind you every day at this time! 🔥\n\n"
-            f"Note: Reminders are lost when the bot restarts."
-        )
-        
+    if 'temp_goals' not in context.user_data or not context.user_data['temp_goals']:
+        await update.message.reply_text("❌ No goals added! Use /goals to start again.")
         return ConversationHandler.END
-        
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid format. Please use HH:MM in 24-hour format.\n"
-            "Example: 09:00 or 21:30\n\n"
-            "Send /cancel to cancel."
-        )
-        return WAITING_FOR_TIME
-    except Exception as e:
-        print(f"❌ Error setting reminder: {e}")
-        await update.message.reply_text(
-            "❌ Sorry, there was an error setting the reminder. Please try again."
-        )
-        return ConversationHandler.END
-
-async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel reminder setup"""
-    await update.message.reply_text("❌ Reminder setup cancelled.")
+    
+    user_data = await get_user_data(user_id)
+    user_data['goals'] = context.user_data['temp_goals']
+    await save_user_data(user_id, user_data)
+    
+    goals_list = "\n".join([f"• {goal}" for goal in user_data['goals']])
+    
+    await update.message.reply_text(
+        f"🎉 Goals saved successfully!\n\n{goals_list}\n\n"
+        f"Now you can:\n"
+        f"• /checkin - Mark today's progress\n"
+        f"• /reminders - Set reminders for each goal"
+    )
+    
+    context.user_data.pop('temp_goals', None)
     return ConversationHandler.END
 
-async def reminder_job(chat_id, application):
-    """Send daily reminder message"""
-    try:
-        await application.bot.send_message(
-            chat_id=chat_id, 
-            text="⏰ Time for your daily /checkin! Don't break the streak! 🔥"
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button clicks"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if query.data == "add_goals":
+        context.user_data['temp_goals'] = []
+        await query.edit_message_text(
+            "📝 Send me your next goal:\n\n"
+            "Send /done when finished"
         )
-        print(f"✅ Reminder sent to chat {chat_id}")
-    except Exception as e:
-        print(f"❌ Error sending reminder to {chat_id}: {e}")
+        return ADDING_GOALS
+    
+    elif query.data == "clear_goals":
+        user_data = await get_user_data(user_id)
+        user_data['goals'] = []
+        user_data['checkins'] = {}
+        user_data['reminders'] = {}
+        await save_user_data(user_id, user_data)
+        await query.edit_message_text(
+            "🗑️ All goals cleared!\n\nUse /goals to set new goals."
+        )
+    
+    elif query.data == "keep_goals":
+        await query.edit_message_text("✅ Goals kept! Use /checkin to track progress.")
+    
+    elif query.data.startswith("checkin_"):
+        # Handle check-in for specific goal
+        goal = query.data.replace("checkin_", "")
+        user_data = await get_user_data(user_id)
+        today = str(date.today())
+        
+        if today not in user_data['checkins']:
+            user_data['checkins'][today] = {}
+        
+        # Toggle completion
+        current = user_data['checkins'][today].get(goal, False)
+        user_data['checkins'][today][goal] = not current
+        await save_user_data(user_id, user_data)
+        
+        # Refresh the check-in view
+        await show_checkin_status(query, user_id, user_data, today)
+    
+    elif query.data == "skip_checkin":
+        await query.edit_message_text("⏭️ Check-in skipped. See you tomorrow! 💪")
+    
+    return ConversationHandler.END
+
+async def show_checkin_status(query, user_id, user_data, today):
+    """Show check-in buttons with current status"""
+    keyboard = []
+    
+    for goal in user_data['goals']:
+        completed = user_data['checkins'].get(today, {}).get(goal, False)
+        emoji = "✅" if completed else "⭕"
+        keyboard.append([InlineKeyboardButton(
+            f"{emoji} {goal}",
+            callback_data=f"checkin_{goal}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("⏭️ Done for today", callback_data="skip_checkin")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    completed_count = sum(user_data['checkins'].get(today, {}).values())
+    total = len(user_data['goals'])
+    
+    await query.edit_message_text(
+        f"📋 Today's Check-in ({completed_count}/{total} completed)\n\n"
+        f"Tap goals to mark as done:",
+        reply_markup=reply_markup
+    )
+
+async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show check-in interface"""
+    user_id = update.effective_user.id
+    user_data = await get_user_data(user_id)
+    
+    if not user_data['goals']:
+        await update.message.reply_text(
+            "⚠️ No goals set! Use /goals to set them first."
+        )
+        return
+    
+    today = str(date.today())
+    keyboard = []
+    
+    for goal in user_data['goals']:
+        completed = user_data['checkins'].get(today, {}).get(goal, False)
+        emoji = "✅" if completed else "⭕"
+        keyboard.append([InlineKeyboardButton(
+            f"{emoji} {goal}",
+            callback_data=f"checkin_{goal}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("⏭️ Done for today", callback_data="skip_checkin")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    completed_count = sum(user_data['checkins'].get(today, {}).values())
+    total = len(user_data['goals'])
+    
+    await update.message.reply_text(
+        f"📋 Today's Check-in ({completed_count}/{total} completed)\n\n"
+        f"Tap goals to mark as done:",
+        reply_markup=reply_markup
+    )
+
+async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed progress"""
+    user_id = update.effective_user.id
+    user_data = await get_user_data(user_id)
+    
+    if not user_data['goals']:
+        await update.message.reply_text("⚠️ No goals set! Use /goals first.")
+        return
+    
+    # Calculate stats for last 7 days
+    today = date.today()
+    dates = [(today - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
+    
+    progress_text = "📊 *Your Progress (Last 7 Days)*\n\n"
+    
+    total_completed = 0
+    total_possible = len(user_data['goals']) * 7
+    
+    for goal in user_data['goals']:
+        week_status = ""
+        goal_completed = 0
+        
+        for date_str in dates:
+            if user_data['checkins'].get(date_str, {}).get(goal, False):
+                week_status += "✅"
+                goal_completed += 1
+            else:
+                week_status += "⭕"
+        
+        total_completed += goal_completed
+        percentage = int((goal_completed / 7) * 100)
+        progress_text += f"🎯 *{goal}*\n{week_status} ({goal_completed}/7 - {percentage}%)\n\n"
+    
+    # Overall stats
+    overall = int((total_completed / total_possible) * 100) if total_possible > 0 else 0
+    progress_text += f"📈 *Overall: {total_completed}/{total_possible} ({overall}%)*\n\n"
+    
+    # Current streak
+    streak = calculate_streak(user_data)
+    progress_text += f"🔥 *Current Streak: {streak} days*"
+    
+    await update.message.reply_text(progress_text, parse_mode="Markdown")
+
+def calculate_streak(user_data):
+    """Calculate current streak"""
+    if not user_data['goals']:
+        return 0
+    
+    streak = 0
+    today = date.today()
+    
+    for i in range(365):  # Check up to 1 year back
+        check_date = (today - timedelta(days=i)).isoformat()
+        day_checkins = user_data['checkins'].get(check_date, {})
+        
+        # Check if at least one goal was completed
+        if any(day_checkins.values()):
+            streak += 1
+        else:
+            break
+    
+    return streak
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel any operation"""
+    await update.message.reply_text("❌ Operation cancelled.")
+    return ConversationHandler.END
 
 # === Main Function ===
 
@@ -215,7 +329,7 @@ async def main():
     """Start the bot"""
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        print("❌ BOT_TOKEN environment variable not set.")
+        print("❌ BOT_TOKEN not set.")
         return
 
     app = ApplicationBuilder().token(token).build()
@@ -224,28 +338,31 @@ async def main():
     scheduler = AsyncIOScheduler()
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
-    print("✅ Scheduler started")
 
-    # Add Command Handlers
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("setgoals", set_goals))
     app.add_handler(CommandHandler("checkin", checkin))
-    app.add_handler(CommandHandler("progress", show_progress))
+    app.add_handler(CommandHandler("progress", progress))
     
-    # Reminder conversation handler
-    reminder_handler = ConversationHandler(
-        entry_points=[CommandHandler("setreminder", set_reminder_start)],
+    # Goals conversation
+    goals_handler = ConversationHandler(
+        entry_points=[CommandHandler("goals", goals_start)],
         states={
-            WAITING_FOR_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder_time)]
+            ADDING_GOALS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_goal),
+                CommandHandler("done", done_adding_goals)
+            ]
         },
-        fallbacks=[CommandHandler("cancel", cancel_reminder)]
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
-    app.add_handler(reminder_handler)
+    app.add_handler(goals_handler)
+    
+    # Button callbacks
+    app.add_handler(CallbackQueryHandler(button_callback))
 
     print("✅ Bot is running...")
     await app.run_polling()
 
-# === Start the bot ===
 if __name__ == "__main__":
     nest_asyncio.apply()
     asyncio.run(main())
